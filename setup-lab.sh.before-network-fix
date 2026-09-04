@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $EUID == 0 ]] || { echo 'Запустите: sudo bash setup-lab.sh'; exit 1; }
+command -v snap >/dev/null || { echo 'Требуется snap и systemd в WSL.'; exit 1; }
+if ! command -v lxc >/dev/null; then
+  snap install lxd --channel=5.21/stable
+fi
+export PATH="$PATH:/snap/bin"
+# Инициализируем только новую установку, сохраняя существующие настройки.
+if [[ $(lxc storage list --format csv | wc -l) -eq 0 ]]; then
+  lxd init --auto
+fi
+if ! lxc network show lxdbr0 >/dev/null 2>&1; then
+  lxc network create lxdbr0 ipv4.address=10.113.5.1/24 ipv4.nat=true ipv6.address=none
+fi
+# Отдельный профиль не меняет конфигурацию других контейнеров.
+if ! lxc profile show study-lab >/dev/null 2>&1; then
+  lxc profile create study-lab
+  lxc profile device add study-lab eth0 nic name=eth0 network=lxdbr0
+fi
+names=(ctrl node1 node2 mon)
+declare -A ips
+for name in "${names[@]}"; do
+  cpu=2; ram=2GiB; disk=15GB
+  if [[ $name == mon ]]; then cpu=1; ram=1536MiB; disk=10GB; fi
+  if ! lxc info "$name" >/dev/null 2>&1; then
+    lxc launch ubuntu:24.04 "$name" -p default -p study-lab \
+      -c limits.cpu="$cpu" -c limits.memory="$ram" -d root,size="$disk"
+  else
+    echo "Используется существующий контейнер: $name"
+    if ! lxc info "$name" | grep -q 'Status: RUNNING'; then lxc start "$name"; fi
+  fi
+  for ((i=0;i<60;i++)); do
+    ips[$name]=$(lxc exec "$name" -- sh -c "ip -4 -o addr show dev eth0 scope global | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null || true)
+    [[ -n ${ips[$name]} ]] && break
+    sleep 2
+  done
+  [[ -n ${ips[$name]} ]] || { echo "Нет IPv4: $name"; exit 1; }
+  lxc exec "$name" -- bash -s <<'GUEST'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+if command -v cloud-init >/dev/null; then cloud-init status --wait || [[ $? == 2 ]]; fi
+apt-get -o Acquire::ForceIPv4=true update
+apt-get -o Acquire::ForceIPv4=true install -y openssh-server sudo curl wget git vim htop net-tools iproute2 iputils-ping dnsutils jq python3 python3-pip python3-venv
+if ! id student >/dev/null 2>&1; then
+  useradd -m -s /bin/bash student
+  echo 'student:student' | chpasswd
+fi
+printf 'student ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/student-lab
+chmod 440 /etc/sudoers.d/student-lab
+visudo -cf /etc/sudoers.d/student-lab
+printf 'PasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /etc/ssh/sshd_config.d/00-study-lab.conf
+sshd -t
+systemctl restart ssh
+GUEST
+ done
+for name in "${names[@]}"; do
+  {
+    for other in "${names[@]}"; do printf '%s %s # LAB-SysAdmin-2026\n' "${ips[$other]}" "$other"; done
+  } | lxc exec "$name" -- bash -c 'sed -i "/# LAB-SysAdmin-2026/d" /etc/hosts; cat >> /etc/hosts'
+done
+lxc exec ctrl -- su - student -c 'mkdir -p ~/.ssh; chmod 700 ~/.ssh; test -f ~/.ssh/id_ed25519 || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""'
+pubkey=$(lxc exec ctrl -- cat /home/student/.ssh/id_ed25519.pub)
+for name in node1 node2 mon; do
+  printf '%s\n' "$pubkey" | lxc exec "$name" -- bash -c 'install -d -o student -g student -m 700 /home/student/.ssh; touch /home/student/.ssh/authorized_keys; IFS= read -r key; grep -qxF "$key" /home/student/.ssh/authorized_keys || printf "%s\n" "$key" >> /home/student/.ssh/authorized_keys; chown student:student /home/student/.ssh/authorized_keys; chmod 600 /home/student/.ssh/authorized_keys'
+done
+lxc exec ctrl -- su - student -c 'mkdir -p ~/sysadmin-2026/{ansible,terraform,k8s/manifests,docs}'
+lxc exec ctrl -- bash -c 'cat > /home/student/sysadmin-2026/ansible/inventory.ini' <<'INI'
+[control]
+ctrl ansible_connection=local
+
+[workers]
+node1 ansible_user=student
+node2 ansible_user=student
+
+[monitoring]
+mon ansible_user=student
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+INI
+lxc exec ctrl -- bash -c 'cat > /home/student/sysadmin-2026/ansible/ansible.cfg' <<'INI'
+[defaults]
+inventory = ./inventory.ini
+remote_user = student
+INI
+lxc exec ctrl -- bash -c 'echo "Лабораторная 1: LXD, сеть и SSH. Ansible и сервисы устанавливаются на следующих занятиях." > /home/student/sysadmin-2026/docs/README.md; chown -R student:student /home/student/sysadmin-2026'
+for name in node1 node2 mon; do
+  lxc exec ctrl -- ping -c 2 "$name"
+  lxc exec ctrl -- su - student -c "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 student@$name 'hostname; echo OK'"
+done
+lxc exec ctrl -- git --version
+lxc exec ctrl -- python3 --version
+lxc list
+echo 'Готово. Вход: sudo lxc exec ctrl -- su - student'
