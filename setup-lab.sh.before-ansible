@@ -91,7 +91,6 @@ for name in node1 node2 mon; do
   printf '%s\n' "$pubkey" | lxc exec "$name" -- bash -c 'install -d -o student -g student -m 700 /home/student/.ssh; touch /home/student/.ssh/authorized_keys; IFS= read -r key; grep -qxF "$key" /home/student/.ssh/authorized_keys || printf "%s\n" "$key" >> /home/student/.ssh/authorized_keys; chown student:student /home/student/.ssh/authorized_keys; chmod 600 /home/student/.ssh/authorized_keys'
 done
 lxc exec ctrl -- su - student -c 'mkdir -p ~/sysadmin-2026/{ansible,terraform,k8s/manifests,docs}'
-lxc 
 lxc exec ctrl -- bash -c 'cat > /home/student/sysadmin-2026/ansible/inventory.ini' <<'INI'
 [control]
 ctrl ansible_connection=local
@@ -118,13 +117,5 @@ for name in node1 node2 mon; do
 done
 lxc exec ctrl -- git --version
 lxc exec ctrl -- python3 --version
-
-echo "Установка Ansible на узел ctrl"
-lxc exec "$name" -- bash -s <<'GUEST'
-	set -Eeuo pipefail
-	export DEBIAN_FRONTEND=noninteractive
-	if command -v cloud-init >/dev/null; then cloud-init status --wait || [[ $? == 2 ]]; fi
-	apt-get -o Acquire::ForceIPv4=true install -y ansible
-GUEST
-
+lxc list
 echo 'Готово. Вход: sudo lxc exec ctrl -- su - student'
